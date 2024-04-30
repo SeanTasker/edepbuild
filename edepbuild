@@ -1,0 +1,345 @@
+#! /bin/bash
+### -====================================-
+### Echo automated dependency build script
+### -====================================-
+### You must specify a target platform.
+###
+### $0 targetName [library]
+###
+### If you specify a 'library' then only that library is built.
+###
+### edepbuild uses scripts in the scripts/{PLATFORM} folder. These define how the dependency should be built.
+### The default process is to use configure and make to build each target but the target script files can override
+### any aspect of the build process.
+###
+### There are two ways to control a dependency build.
+###
+### 1. Simple - Set some variables to define how configure or cmake are used
+### 2. Custom - Override build functions to control part of all aspects of a build
+###
+### In both situations this script will perform the following operations in order
+###
+###     download
+###     extract
+###     patch_prepare
+###     prepare
+###     patch_build
+###     build
+###     patch_install
+###     install
+###
+### - The download step is performed from the X directory and should download the ARCHIVE_NAME to the X folder.
+### - The extract step can be skipped by setting NO_EXTRACT=1 before invoking the $0.
+### - The build directory is removed before extracting to ensure a clean build environment for the dependency
+###   This can be skipped by setting NO_REMOVE_BUILD_DIR=1 before invoking $0
+###
+### All other steps are exectured from the build/platform/dependency folder
+###
+### The extract step will extract ARCHIVE_NAME to the dependency build folder and step out the first level folder
+### in the archive. This assumes that every archive will contain a top level folder with the source in it. The
+### resource for stripping this top level folder is there can be a lot of variation about the name of this folder
+### so instead we extract the contents of the folder into the dependency build folder.
+###
+### The patch_* steps are no op steps that can be overridden if custom behaviour is required before the normal
+### build steps. Each other step can be overridden as defined below.
+###
+### - Simple -
+### If a dependency follows common build processes and just needs to be configured with some cmake or configure
+### flags then the following variables can be used to customise the build.
+### 
+###     USE_CMAKE - defaults to 0 but if set to 1 cmake will be used instead of ./configure
+###     DOWNLOAD_URL - The complete URL to download the archive from
+###     ARCHIVE_NAME - The complete archive name, e.g. something.tar.gz. The default extract step assumes a tar
+###                    archive. See - Custom - on how to override this.
+###
+### configure variables - used in the prepare step
+###     CONFIGURE_OPTIONS - Any additional configure command line arguments
+###
+### cmake variables - used in the prepare step
+###     CMAKE_BUILD_DIRECTORY - Defaults to "build" this will be created if it does not exist and used as the
+###                             build folder.
+###     CMAKE_DIRECTORY - Defaults to full/path/to/build/platform/dependency" , but if cmake needs to point
+###                       to another directory this can be used to override. If a relative path is required or
+###                       more useful then the directory this references from is CMAKE_BUILD_DIRECTORY
+###     CMAKE_OPTIONS - Any additional cmake command line arguments for example to specify -DSOMETHING=ON
+###
+### Make options - used in the build step
+###     MAKE_OPTIONS - Additional options used when running make
+###
+### - Custom -
+### Any of the above listed steps are implemented as functions. These can be overridden in a script by
+### defining the function again as:
+###
+###     step()
+###     {
+###         echo "Custom command"
+###     }
+###
+### For example, if you want to override the build step so that GNU make is not used then you can include:
+###
+###     build()
+###     {
+###         echo "Custom build process started"
+###     }
+###
+### NOTE: a build step cannot be empty or it will result in error. This is a bash limitation. So at minimum you
+### should output a message indicating that you have skipped a step.
+###
+### Sometimes additional steps are required before prepare, build or install. The steps patch_prepare,
+### patch_build and patch_install can be used to insert additional processing but still stick to the default
+### step. This can be useful if a patch is required for building on a specific platform for example.
+###
+### The step definitions are reset for each dependency so your step won't affect another build.
+###
+### = Additional script notes =
+### The scripts are executed by using source. So it is possible to include commands in the script. This is how
+### custom builds used to be implemented. This does mean you can execute arbitrary commands before any steps
+### are executed. This typically isn't advised though as it might lead to confusion.
+###
+### It is possible to set environment variables that persist for dependencies that follow.
+###
+### -====================================-
+###
+
+if [ "$1" = "" ] ; then
+	sed -n 's/^### \?//p' "$0"
+	exit
+fi
+
+export ECHO_PLATFORM=$1
+ONLY_LIB=$2
+
+ECHO_INSTALL_DIR=${ECHO_INSTALL_DIR:="/opt/echo3"}
+ECHO_LIB_DIR=${ECHO_INSTALL_DIR}/${ECHO_PLATFORM}
+ECHO_X_DIR=${ECHO_X_DIR:="X"}
+NO_REMOVE_BUILD_DIR=${NO_REMOVE_BUILD_DIR:="0"}
+NO_EXTRACT=${NO_EXTRACT:="0"}
+NUM_BUILD_THREADS=${NUM_BUILD_THREADS:=$(nproc)}
+ECHO_DEP_ROOT_DIR=`pwd`
+ECHO_DEP_BUILD_DIR="$ECHO_DEP_ROOT_DIR/build"
+export ECHO_DEP_SCRIPTS_DIR="$ECHO_DEP_ROOT_DIR/scripts"
+
+if [ "$ONLY_LIB" == "" ]; then
+	if [ -e "$ECHO_DEP_SCRIPTS_DIR/$ECHO_PLATFORM/build.config" ]; then
+		source "$ECHO_DEP_SCRIPTS_DIR/$ECHO_PLATFORM/build.config"
+	else
+		echo "\"$ECHO_DEP_SCRIPTS_DIR/$ECHO_PLATFORM/build.config\" does not exist. Unable to determine what to build." 
+		exit 1;
+	fi
+else
+	BUILD_ORDER="$ONLY_LIB"
+fi
+
+if [ "$BUILD_ORDER" == "" ]; then
+	echo "Nothing to build. Make sure you \"export BUILD_ORDER\" in $ECHO_DEP_SCRIPTS_DIR/$ECHO_PLATFORM/build.config"
+	exit 1;
+fi
+
+#Check for the platform build directory and create if necesary 
+if [ ! -d "$ECHO_DEP_BUILD_DIR/$ECHO_PLATFORM" ]; then
+	echo "Creating platform directory - $ECHO_DEP_BUILD_DIR/$ECHO_PLATFORM"
+	mkdir -p $ECHO_DEP_BUILD_DIR/$ECHO_PLATFORM
+else
+	echo "Platform directory exists - $ECHO_DEP_BUILD_DIR/$ECHO_PLATFORM"
+fi
+
+#Check for the lib platform directory and create if necesary 
+if [ ! -d "$ECHO_LIB_DIR" ]; then
+	echo "Creating lib directory - $ECHO_LIB_DIR"
+	mkdir -p $ECHO_LIB_DIR
+else
+	echo "Lib directory exists - $ECHO_LIB_DIR"
+fi
+
+#Check for the lib platform directory and create if necesary 
+if [ ! -d "$ECHO_LIB_DIR/$ECHO_PLATFORM" ]; then
+	echo "Creating library platform directory - $ECHO_LIB_DIR"
+	mkdir -p "$ECHO_LIB_DIR/$ECHO_PLATFORM"
+else
+	echo "Library platform directory exists - $ECHO_LIB_DIR"
+fi
+
+#Get the absolute path of the lib platform directory
+ECHO_ROOT_DIR=`pwd`
+cd "$ECHO_LIB_DIR"
+ECHO_LIB_DIR=`pwd`
+cd "$ECHO_ROOT_DIR"
+
+#Change to the unbuilt directory
+cd $ECHO_X_DIR
+
+if [ "$BUILD_ORDER" == "" ]; then
+	echo "Unable to build as build order was not determined. Be sure to set:"
+	echo "    \"PLATFORM_REQUIRED_LIBS\" in "
+	echo "    \"ECHO_REQUIRED_LIBS\" in $ECHO_DEP_SCRIPTS_DIR/$ECHO_PLATFORM/build.config"
+	exit 1;
+fi
+
+echo "Build order: $BUILD_ORDER"
+
+CLEAN_PATH=$PATH
+
+# Check for platform config
+if [ ! -e "$ECHO_DEP_SCRIPTS_DIR/$ECHO_PLATFORM/$ECHO_PLATFORM.config" ]; then
+	echo "------------------------------"
+	echo "Please add a platform config file: $ECHO_PLATFORM"
+	echo "------------------------------"
+	exit 1
+fi
+
+#For each folder in the platform directory
+for libDirectory in $BUILD_ORDER; do
+		MAKE_FILE=""
+		#Change to platform build folder
+		mkdir -p "${ECHO_DEP_ROOT_DIR}/${ECHO_X_DIR}/${libDirectory}"
+		cd "${ECHO_DEP_ROOT_DIR}/${ECHO_X_DIR}/${libDirectory}"
+		echo "------------------------------"
+		echo "$libDirectory"
+		echo "------------------------------"
+		ECHO_CONFIG_FILE="$ECHO_DEP_SCRIPTS_DIR/$ECHO_PLATFORM/$ECHO_PLATFORM-$libDirectory.config"
+		if [ ! -e $ECHO_CONFIG_FILE ]; then
+			echo "Library platform edepbuild configuration file not found. Please create \"$ECHO_CONFIG_FILE\" and set at least DOWNLOAD_URL"
+			exit 1
+		fi
+
+		USE_CMAKE=0
+		CONFIGURE_OPTIONS=""
+		CMAKE_OPTIONS=""
+		CMAKE_DIRECTORY="${ECHO_DEP_BUILD_DIR}/${ECHO_PLATFORM}/${libDirectory}"
+		CMAKE_BUILD_DIRECTORY="build"
+		MAKE_OPTIONS=""
+		PKG_CONFIG_PATH=${ECHO_LIB_DIR}/lib/pkgconfig
+		unset DOWNLOAD_URL
+		unset ARCHIVE_NAME
+
+		# Remove the build directory on error
+		#error()
+		##{
+			#rm -r "${ECHO_DEP_BUILD_DIR}/${ECHO_PLATFORM}/${libDirectory}"
+		#}; trap error ERR
+
+		download()
+		{
+			if [ -z ${DOWNLOAD_URL+x} ]; then
+				DOWNLOAD_URL="https://www.emblem.net.au/ed/${libDirectory}/${ARCHIVE_NAME}.tar.gz"
+			fi
+			if [ -z {$ARCHIVE_NAME+x} ]; then
+				echo "Missing ARCHIVE_NAME for archive download"
+				exit 1;
+			fi
+			if [ ! -e ${ARCHIVE_NAME} ]; then
+				echo "Downloading: ${DOWNLOAD_URL}"
+				curl -L ${DOWNLOAD_URL} -o ${ARCHIVE_NAME}
+				if ! [ $? -eq 0 ]; then
+					echo "edepbuild: There were errors downloading."
+					exit 1;
+				fi
+			else
+				echo "${ARCHIVE_NAME} exists. Download skipped."
+			fi
+		}
+
+		extract()
+		{
+			echo "edepbuild: extract ${ECHO_DEP_ROOT_DIR}/${ECHO_X_DIR}/${libDirectory}/${ARCHIVE_NAME}"
+			cat ${ECHO_DEP_ROOT_DIR}/${ECHO_X_DIR}/${libDirectory}/${ARCHIVE_NAME} | bsdtar -xf- -C . --strip-components=1
+
+			if ! [ $? -eq 0 ]; then
+				tail ${ECHO_DEP_ROOT_DIR}/${ECHO_X_DIR}/${libDirectory}/${ARCHIVE_NAME}
+				echo "edepbuild: There were errors extracting."
+				rm ${ECHO_DEP_ROOT_DIR}/${ECHO_X_DIR}/${libDirectory}/${ARCHIVE_NAME}
+				exit 1;
+			fi
+		}
+
+		patch_prepare()
+		{
+			echo "edepbuild: No prepare patch"
+		}
+
+		prepare()
+		{
+			if [ $USE_CMAKE -eq 0 ] ; then
+				chmod +x configure
+				./configure --prefix=$ECHO_LIB_DIR $CONFIGURE_OPTIONS
+			else
+				mkdir -p ${CMAKE_BUILD_DIRECTORY}
+				cd ${CMAKE_BUILD_DIRECTORY}
+				echo "Using ${CMAKE_DIRECTORY}"
+				cmake "${CMAKE_DIRECTORY}" -DCMAKE_FIND_ROOT_PATH="${ECHO_LIB_DIR}" -DCMAKE_PREFIX_PATH="${ECHO_LIB_DIR}" -DCMAKE_INSTALL_PREFIX="${ECHO_LIB_DIR}" -DCMAKE_INSTALL_RPATH="${ECHO_LIB_DIR}" -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=TRUE $CMAKE_OPTIONS_PLATFORM $CMAKE_OPTIONS -G "Unix Makefiles"
+			fi
+			
+			if [ $? -eq 0 ]; then
+				echo "edepbuild: $ECHO_PLATFORM-$libDirectory prepare step complete"
+			else
+				echo "edepbuild: error: $ECHO_PLATFORM-$libDirectory prepare failed"
+				exit 1
+			fi
+		}
+
+		patch_build()
+		{
+			echo "edepbuild: No build patch"
+		}
+
+		build()
+		{
+			make $MAKE_FILE $MAKE_OPTIONS -j${NUM_BUILD_THREADS}
+
+			if [ $? -eq 0 ]; then
+				echo "edepbuild: build $libDirectory complete"
+			else
+				echo "edepbuild: error: $ECHO_PLATFORM-$libDirectory build failed"
+				exit 1
+			fi
+		}
+
+		patch_install()
+		{
+			echo "edepbuild: No install patch"
+		}
+
+		install()
+		{
+			make install $MAKE_FILE
+			if [ $? -ne 0 ] ; then
+				echo "edepbuild: error: $ECHO_PLATFORM-$libDirectory make install failed"
+				exit 1
+			fi
+		}
+
+		post_install()
+		{
+			echo "edepbuild: No post install step"
+		}
+
+		source "$ECHO_DEP_SCRIPTS_DIR/$ECHO_PLATFORM/$ECHO_PLATFORM.config"
+		source $ECHO_CONFIG_FILE
+
+		download
+
+		cd "$ECHO_DEP_BUILD_DIR/$ECHO_PLATFORM"
+
+		if [ -e "${libDirectory}" ] && [ "${NO_REMOVE_BUILD_DIR}" == "0" ]; then
+			echo "edepbuild: removing build directory: ${libDirectory}"
+			rm -R ${libDirectory}
+		fi
+
+		mkdir -p $libDirectory
+		cd $libDirectory
+
+		if [ "${NO_EXTRACT}" == "0" ]; then
+			extract
+		fi
+		patch_prepare
+		prepare
+		patch_build
+		build
+		patch_install
+		install
+		post_install
+
+		export PATH=$CLEAN_PATH
+		echo "edepbuild: Finished!"
+done
+
